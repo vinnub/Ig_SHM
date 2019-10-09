@@ -1,10 +1,15 @@
 import pandas as pd
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 import networkx as nx
 import pyvolve
 from joblib import Parallel, delayed
+
+########################################################################################################################
+########################################## Delta Matrices class ########################################################
+########################################################################################################################.
 
 def get_delta_matrix(filename, sheetname):
     '''
@@ -47,6 +52,9 @@ class delta_matrices:
                f"Columns = {list(self.volume.columns)}"
             
     def plot(self):
+        '''
+        Plot the delta matrices as heatmaps.
+        '''
         fig, axs = plt.subplots(2, 2, figsize = (16,10))
         axs = axs.ravel()
         for i, a_property in enumerate(['volume', 'polarity', 'composition', 'aromaticity']):
@@ -57,6 +65,9 @@ class delta_matrices:
             axs[i].set_title(a_property)
             
     def deltas_between_AA(self, i, j):
+        '''
+        Get delta values for 4 properties between amino acid i and j. 
+        '''
         assert (type(i) == str and type(j)==str), "Arguments must be strings"
         to_return = {}
         to_return['volume'] = self.volume[i][j]
@@ -75,16 +86,36 @@ class delta_matrices:
         for i, _ in enumerate(seq1):
             df_to_return[i] = pd.Series(self.deltas_between_AA(seq1[i], seq2[i]))
         return df_to_return
-    
+
+########################################################################################################################
+########################################## Clonal Graph class ##########################################################
+########################################################################################################################.
     
 class clonal_graph:
+    
+    '''
+    A class that represents a clonal graph on amino acid sequences. 
+    To create an instance, a shm_file and a corresponding seqs_file are needed. These files should be the output of IgEvolution. 
+    '''
     
     def __init__(self, shm_file, seqs_file):
         self.shm_file = shm_file
         self.seqs_file = seqs_file
         self.simulations = []
         
+        def get_original_sequences(a_seqs_file):
+            '''
+            Get original sequences from the seqs_file. 
+            '''
+            seqs = pd.read_csv(a_seqs_file, sep = '\t')
+            seqs.Index = ['Node' + str(item) + 'a' for item in seqs.Index]
+            org_sequences = seqs[['Index', 'AA_seq']].set_index('Index').to_dict()['AA_seq']
+            return org_sequences
+        
         def get_nxgraph_from_shm_file(shm_filename):
+            '''
+            Create a networkx graph from the shm_file.
+            '''
             shm_df = pd.read_csv(shm_filename, sep = '\t')
             edges = set()
             for edge_list in shm_df.Edges:
@@ -99,53 +130,71 @@ class clonal_graph:
             bfs_edges = list(nx.bfs_edges(G, root_name))
             return G,root_name, bfs_edges
 
-        def extract_root_sequence(root_name, a_seqs_file):
-            seqs_df = pd.read_csv(a_seqs_file, sep = '\t', index_col=0)
-            root_index = int(root_name.split('Node')[1].split('a')[0])
-            return seqs_df.loc[root_index]['AA_seq']
 
         def get_pyvolve_phylogeny_from_nxgraph(G, root_seq):
+            '''
+            Transform the clonal graph into the format required by pyvolve. 
+            '''
             tree_newick = networkx_to_newick(G)
             scale_tree = 1/len(root_seq)
             tree = pyvolve.read_tree(tree =tree_newick.replace('a', 'a:'+str(scale_tree)))
             return tree 
         
+        self.org_seqs  = get_original_sequences(self.seqs_file)
         self.nx_graph, self.root_name, self.edges = get_nxgraph_from_shm_file(self.shm_file)
-        self.root_sequence = extract_root_sequence(self.root_name, self.seqs_file)
+        self.root_sequence = self.org_seqs[self.root_name]
         self.pyvolve_phylogeny = get_pyvolve_phylogeny_from_nxgraph(self.nx_graph, self.root_sequence)
         
         
-    def sims_to_null_dists_serially(self, a_delta_matrices_instance):
+    def sims_to_null_dists_serially(self, a_delta_matrices_instance, return_mean_stats = False ):
+        '''
+        Uses the function 'get_test_stats' to generate test statistics from one simulation and then puts the test statistics from multiple simulations in one dataframe. 
+        a_delta_matrices_instance is passed to the function 'get_test_stats'. 
+        This function loops through all the simulations serially. Also see the function 'sims_to_null_dists_parallel'. 
+        '''
         assert len(self.simulations) !=0, "No simulation data present in the clonal_graph object"
         test_stats_dfs = []
         for i, sim_seqs in enumerate(self.simulations):
-            a_df = get_test_stats(sim_seqs, self.edges, a_delta_matrices_instance).add_suffix('_sim'+str(i))
+            a_df = get_test_stats(sim_seqs, self.edges, a_delta_matrices_instance, return_mean_stats).add_suffix('_sim'+str(i))
             test_stats_dfs.append(a_df)
 
         return pd.concat(test_stats_dfs, axis = 1)
     
+    
     def sims_to_null_dists_parallel(self, a_delta_matrices_instance, cpus, return_mean_stats = False ):
+        '''
+        Uses the function 'get_test_stats' to generate test statistics from one simulation and then puts the test statistics from multiple simulations in one dataframe. 
+        a_delta_matrices_instance is passed to the function 'get_test_stats'. 
+        This function processes multiple simulations at a time, using a different process for each.  
+        '''
         assert len(self.simulations) !=0, "No simulation data present in the clonal_graph object"
         test_stats_dfs= Parallel(n_jobs=cpus)(delayed(get_test_stats)(sim_seqs, self.edges, a_delta_matrices_instance, return_mean_stats) \
                            for sim_seqs in self.simulations)
         return pd.concat(test_stats_dfs, axis = 1)
 
-    def get_observed_stats(self, a_delta_matrices_instance, return_mean_stats = False):
-        shm_df =  pd.read_csv(self.shm_file, sep = '\t')
-        add_deltas = shm_df.apply(lambda x : x['Multiplicity'] *\
-                                    pd.Series(a_delta_matrices_instance.deltas_between_AA(x['Src_AA'], x['Dst_AA'])), axis = 1)
-        shm_df_with_deltas = pd.concat([shm_df, add_deltas], axis=1)
-        observed_stats = shm_df_with_deltas.groupby(['Region', 'Position'])[['Multiplicity',
-                                                                             'volume', 'polarity', 
-                                                                             'composition', 'aromaticity']].sum()
-        if not return_mean_stats:
-            return observed_stats
-        else:
-            return observed_stats.apply(lambda x : x/x['Multiplicity'], axis = 1)
+    
 
-
+    def get_observed_stats(self, a_delta_matrices_instance, return_mean_stats = False ):
+        '''
+        Uses the function 'get_test_stats' on original sequences and returns a dataframe contatining positions that have non-zero test statistics along with their region (e.g.FR1).
+        '''
+        all_stats = get_test_stats(self.org_seqs, self.edges, a_delta_matrices_instance, return_mean_stats = return_mean_stats).transpose()
+        non_zero_stats = all_stats[all_stats.apply(sum, 1) != 0]
+        shm_df = pd.read_csv(self.shm_file, sep = '\t')
+        pos_region = shm_df[['Position', 'Region',]].drop_duplicates().set_index('Position')
+        non_zero_stats = pd.concat([non_zero_stats,pos_region], 1)
+        non_zero_stats['Position'] = non_zero_stats.index
+        return non_zero_stats.reset_index(drop = True).set_index(['Region', 'Position'])
+    
+    
     
 def get_test_stats(simulated_seqs, edge_list, a_delta_matrices_instance, return_mean_stats ):
+    '''
+    Return the test statistic for all properties in a list of sequences connected with edges in the edge_list.
+    For each pair of sequences connected by an edge, calculate the deltas for the 4 properties at all positions and get a dataframe. 
+    Add all the dataframes element wise to get a site specific and property specific test statistic. 
+    If return_mean_stats == True, return the mean of the non zero, instead of the sum over all edges. 
+    '''
     
     delta_dfs = []
     for src, dst in edge_list:
@@ -165,7 +214,11 @@ def get_test_stats(simulated_seqs, edge_list, a_delta_matrices_instance, return_
         
     
 def get_num_mutations(seqs_dict, edge_list):
-    
+    '''
+    Return the number of mutations at all positions in a list of sequences connected with edges in the edge_list.
+    For each pair of sequences connected by an edge, see whether a mutation occured at all positions. 
+    Sum over all edges element wise to get site specific number of mutations.  
+    '''
     def diff_between_seqs(seq1, seq2):
         assert len(seq1) == len(seq2), "Lengths of sequences must be the same"
         diff_series = pd.Series(index=range(len(seq1)))
@@ -177,6 +230,58 @@ def get_num_mutations(seqs_dict, edge_list):
     for src, dst in edge_list:
         mutations_bw_two_seqs.append(diff_between_seqs(seqs_dict[src], seqs_dict[dst]))
     return sum(mutations_bw_two_seqs)
+
+########################################################################################################################
+########################## Functions that use both Delta and clonal_graph ##############################################
+########################################################################################################################
+
+def plot_observed_stats(a_clonal_graph, a_delta_matrices_instance, CI_df, model,return_mean_stats= False, savefig = False, filename = None):
+    property_colors = mpl.cm.get_cmap('tab10').colors
+    mpl.rcParams.update({'font.size':14})
+    
+    # Get observed test statistics
+    observed_stats = a_clonal_graph.get_observed_stats(a_delta_matrices_instance, return_mean_stats= return_mean_stats)
+    observed_stats.sort_values([('Position')], inplace=True, ascending=False)
+    
+    # Set up plotting
+    fig, axs = plt.subplots(2, 1, figsize =( 12, 8),gridspec_kw={'height_ratios': [8,1]}, sharex = True)
+    
+    # Subplot 1
+    observed_stats[['volume', 'polarity', 'composition', 'aromaticity']].plot.barh(colors = property_colors, ax = axs[0])
+    for i, key in enumerate(['volume', 'polarity', 'composition', 'aromaticity']):
+        axs[0].axvline(CI_df[model][key], label = key, color = property_colors[i], linestyle = '--', )
+    
+    # Subplot 2
+    pd.Series(CI_df[model]).plot.barh( color = 'slategrey', ax = axs[1])
+    
+    plt.subplots_adjust(hspace=0.05,)
+    plt.tight_layout()
+    if savefig: plt.savefig(filename, dpi = 300)
+        
+
+def create_output_df(a_clonal_graph, a_delta_matrices_instance, CI_df, model,return_mean_stats= False, save_to_file = False, filename = None):
+    # Get observed test statistics
+    observed_stats = a_clonal_graph.get_observed_stats(a_delta_matrices_instance,return_mean_stats= return_mean_stats)
+    observed_stats.sort_values([('Position')], inplace=True, ascending=True)
+    output = pd.concat([observed_stats, observed_stats.apply(lambda x: CI_df[model].add_suffix('_CI_max'), 1)], axis = 1)
+    output.reset_index(inplace = True)
+    if save_to_file: output.to_csv(filename, sep = '\t')
+    return output
+
+########################################################################################################################
+########################################## Other utility functions ####################################################
+########################################################################################################################
+
+
+def CI_from_null(null_distbn_dict, level, plot= True, savefig = False, filename = None):
+    Conf_int = pd.DataFrame()
+    for model in null_distbn_dict:
+        Conf_int[model] = null_distbn_dict[model].apply(lambda x : np.quantile(x, level), 1, )
+    if plot:
+        Conf_int.plot.barh(colormap = 'Accent', figsize = (12, 5));
+        plt.title(f'{level*100}% confidence intervals');
+        if savefig: plt.savefig(filename, dpi = 300)
+    return Conf_int
 
 
 def networkx_to_newick(nx_graph):
