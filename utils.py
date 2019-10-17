@@ -91,6 +91,28 @@ class delta_matrices:
 ########################################## Clonal Graph class ##########################################################
 ########################################################################################################################.
     
+    
+class AA_node:
+    
+    def __init__(self, name, seq, nuc_counts,  CDR1, CDR2, CDR3, V_gene, J_gene):
+        self.name = name
+        self.seq = seq
+        self.CDR1 = CDR1
+        self.CDR2 = CDR2
+        self.CDR3 = CDR3
+        self.V_gene = V_gene
+        self.J_gene = J_gene 
+        self.nuc_counts = nuc_counts
+        self.total_counts = sum([int(item) for item in self.nuc_counts.split(',')])
+        
+    def __repr__(self):
+        return 'AA_node with \n' + str(pd.Series({'Name':self.name,
+                             'V-gene': self.V_gene, 
+                             'J_gene':self.J_gene, 
+                             'Nucleotide sequence Counts':self.nuc_counts}))
+    
+    
+    
 class clonal_graph:
     
     '''
@@ -102,21 +124,32 @@ class clonal_graph:
         self.shm_file = shm_file
         self.seqs_file = seqs_file
         self.simulations = []
+        self.shm_df = pd.read_csv(self.shm_file, sep = '\t')
         
-        def get_original_sequences(a_seqs_file):
+        def get_node_info(a_seqs_file):
             '''
             Get original sequences from the seqs_file. 
             '''
-            seqs = pd.read_csv(a_seqs_file, sep = '\t')
+            def get_AA_node_from_df_row(a_series):
+                node = AA_node(name = a_series.name,
+                               seq = a_series['AA_seq'], 
+                               CDR1=a_series['CDR1'], 
+                               CDR2=a_series['CDR2'], 
+                               CDR3=a_series['CDR3'],
+                               V_gene = a_series['V_gene'], 
+                               J_gene = a_series['J_gene'], 
+                               nuc_counts=a_series['Nucl_mults'] 
+                              )
+                return node
+            seqs = pd.read_csv(a_seqs_file, delim_whitespace = True)
             seqs.Index = ['Node' + str(item) + 'a' for item in seqs.Index]
-            org_sequences = seqs[['Index', 'AA_seq']].set_index('Index').to_dict()['AA_seq']
-            return org_sequences
+            nodes_dict = seqs.set_index('Index').apply(lambda x: get_AA_node_from_df_row(x), 1).to_dict()
+            return nodes_dict
         
-        def get_nxgraph_from_shm_file(shm_filename):
+        def get_nxgraph_from_shm_df(shm_df):
             '''
             Create a networkx graph from the shm_file.
             '''
-            shm_df = pd.read_csv(shm_filename, sep = '\t')
             edges = set()
             for edge_list in shm_df.Edges:
                 edge_splits = edge_list.split(',')
@@ -140,10 +173,13 @@ class clonal_graph:
             tree = pyvolve.read_tree(tree =tree_newick.replace('a', 'a:'+str(scale_tree)))
             return tree 
         
-        self.org_seqs  = get_original_sequences(self.seqs_file)
-        self.nx_graph, self.root_name, self.edges = get_nxgraph_from_shm_file(self.shm_file)
-        self.root_sequence = self.org_seqs[self.root_name]
+        self.nodes  = get_node_info(self.seqs_file)
+        self.nx_graph, self.root_name, self.edges = get_nxgraph_from_shm_df(self.shm_df)
+        self.root_sequence = self.nodes[self.root_name].seq
         self.pyvolve_phylogeny = get_pyvolve_phylogeny_from_nxgraph(self.nx_graph, self.root_sequence)
+        self.leaf_nodes = [node for node in self.nx_graph.nodes if self.nx_graph.out_degree(node) == 0]
+        self.edges_to_leaves = [edge for edge in self.nx_graph.edges if edge[1] in self.leaf_nodes]
+        self.internal_edges = list(set(self.nx_graph.edges).difference(set(self.edges_to_leaves)))
         
         
     def sims_to_null_dists_serially(self, a_delta_matrices_instance, return_mean_stats = False ):
@@ -173,22 +209,55 @@ class clonal_graph:
         return pd.concat(test_stats_dfs, axis = 1)
 
     
+    
+    def get_observed_stats(self, a_delta_matrices_instance, which_edges = 'All', return_mean_stats = False ):
+        '''
+        Uses the function 'get_test_stats' on original sequences and returns a dataframe contatining positions that have non-zero 
+        test statistics along with their region (e.g.FR1).
+        '''
+        which_edges = which_edges.lower()
+        assert which_edges in ['all', 'leaves', 'internal'], 'which_edges must be one from all, leaves, or internal'
+        seqs_dict = {node_name: self.nodes[node_name].seq for node_name in self.nodes}
+        if which_edges == 'all':
+            all_stats = get_test_stats(seqs_dict, self.edges, a_delta_matrices_instance, return_mean_stats = return_mean_stats).transpose()
+        elif which_edges == 'leaves':
+            all_stats = get_test_stats(seqs_dict, self.edges_to_leaves, a_delta_matrices_instance, return_mean_stats = return_mean_stats).transpose()
+        elif which_edges == 'internal':
+            all_stats = get_test_stats(seqs_dict, self.internal_edges, a_delta_matrices_instance, return_mean_stats = return_mean_stats).transpose()
 
-    def get_observed_stats(self, a_delta_matrices_instance, return_mean_stats = False ):
-        '''
-        Uses the function 'get_test_stats' on original sequences and returns a dataframe contatining positions that have non-zero test statistics along with their region (e.g.FR1).
-        '''
-        all_stats = get_test_stats(self.org_seqs, self.edges, a_delta_matrices_instance, return_mean_stats = return_mean_stats).transpose()
         non_zero_stats = all_stats[all_stats.apply(sum, 1) != 0]
         shm_df = pd.read_csv(self.shm_file, sep = '\t')
         pos_region = shm_df[['Position', 'Region',]].drop_duplicates().set_index('Position')
         non_zero_stats = pd.concat([non_zero_stats,pos_region], 1)
         non_zero_stats['Position'] = non_zero_stats.index
         return non_zero_stats.reset_index(drop = True).set_index(['Region', 'Position'])
+
     
+    def get_observed_mutations(self, which_edges):
+        '''
+        Uses the function 'get_num_mutations' on original sequences and returns a dataframe contatining positions that have non-zero 
+        test statistics along with their region (e.g.FR1).
+        '''
+        which_edges = which_edges.lower()
+        assert which_edges in ['all', 'leaves', 'internal'], 'which_edges must be one from all, leaves, or internal'
+        seqs_dict = {node_name: self.nodes[node_name].seq for node_name in self.nodes}
+        if which_edges == 'all':
+            mutations =  get_num_mutations(seqs_dict, self.edges)
+        elif which_edges == 'leaves':
+            mutations =  get_num_mutations(seqs_dict, self.edges_to_leaves)
+        elif which_edges == 'internal':
+            mutations =  get_num_mutations(seqs_dict, self.internal_edges)
+
+        mutations.name  = "#Mutations"
+        pos_region = self.shm_df[['Position', 'Region',]].drop_duplicates().set_index('Position')
+        mutations_with_region = pos_region.join(mutations).reset_index().set_index(['Region', 'Position'])
+        mutations_with_region.sort_values([('Position')], inplace=True, ascending=False)
+        return mutations_with_region
+
+
+
     
-    
-def get_test_stats(simulated_seqs, edge_list, a_delta_matrices_instance, return_mean_stats ):
+def get_test_stats(seqs_dict, edge_list, a_delta_matrices_instance, return_mean_stats ):
     '''
     Return the test statistic for all properties in a list of sequences connected with edges in the edge_list.
     For each pair of sequences connected by an edge, calculate the deltas for the 4 properties at all positions and get a dataframe. 
@@ -198,11 +267,11 @@ def get_test_stats(simulated_seqs, edge_list, a_delta_matrices_instance, return_
     
     delta_dfs = []
     for src, dst in edge_list:
-        delta_dfs.append(a_delta_matrices_instance.deltas_between_seqs(simulated_seqs[src], simulated_seqs[dst]))
+        delta_dfs.append(a_delta_matrices_instance.deltas_between_seqs(seqs_dict[src], seqs_dict[dst]))
     sum_stats = sum(delta_dfs)
     if not return_mean_stats: return sum_stats
     
-    mutations = get_num_mutations(simulated_seqs, edge_list)
+    mutations = get_num_mutations(seqs_dict, edge_list)
     multiple_mutations = mutations[mutations>1]
     if len(multiple_mutations) == 0: return sum_stats
     

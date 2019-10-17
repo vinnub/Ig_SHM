@@ -126,3 +126,5 @@ dmypy.json
 
 
 images/
+all_graphs/
+NB*.ipynb
